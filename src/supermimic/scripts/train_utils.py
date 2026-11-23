@@ -2,13 +2,25 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import wandb
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.tasks.tracking.mdp.commands import resolve_motion_file
 from mjlab.utils.torch import configure_torch_backends
 
 from supermimic.utils.wandb_artifacts import download_artifact_cached
+
+
+def resolve_local_motion_files(spec: str) -> list[str]:
+  """Expand every path or glob in a comma-separated local motion argument."""
+  return [
+    str(Path(path).resolve())
+    for source in spec.split(",")
+    for path in resolve_motion_file(source.strip())
+  ]
 
 
 def download_registry_motions(registry_name: str | None) -> str | list[str] | None:

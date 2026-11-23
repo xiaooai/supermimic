@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import cast
 
 import mjlab.envs.mdp as mdp
 import torch
+from mjlab.asset_zoo.robots import G1_ACTION_SCALE
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
-from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
+from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers import ObservationGroupCfg, ObservationTermCfg, RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
-from mjlab.tasks.tracking.mdp.commands import MotionCommand
+from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from supermimic.representations import (
@@ -19,6 +22,10 @@ from supermimic.representations import (
   motion_anchor_window,
   motion_goal_window,
 )
+from supermimic.utils.hand_tracking import FINGERTIP_REWARD
+
+from .inspire import HAND_ACTION_SCALE, HAND_BODIES, get_g1_inspire_robot_cfg
+from .inspire_motion import InspireMotionCommandCfg, fingertip_tracking
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
@@ -197,6 +204,35 @@ def gencoord_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   cfg.terminations.pop("ee_body_pos", None)
 
+  return cfg
+
+
+def gencoord_inspire_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Track body and hands using one position action and one motion command."""
+  cfg = gencoord_env_cfg(play=play)
+  cfg.scene.entities["robot"] = get_g1_inspire_robot_cfg()
+  action = cfg.actions["joint_pos"]
+  assert isinstance(action, JointPositionActionCfg)
+  action.scale = {**G1_ACTION_SCALE, **HAND_ACTION_SCALE}
+
+  motion = cast(MotionCommandCfg, cfg.commands["motion"])
+  body_names = motion.body_names
+  args = {field.name: getattr(motion, field.name) for field in fields(motion)}
+  args["body_names"] = (*body_names, *HAND_BODIES)
+  # Independent noise at reset would violate the finger mimic constraints.
+  args["joint_position_range"] = (0.0, 0.0)
+  cfg.commands["motion"] = InspireMotionCommandCfg(**args)
+
+  for name in (
+    "motion_body_pos",
+    "motion_body_ori",
+    "motion_body_lin_vel",
+    "motion_body_ang_vel",
+  ):
+    cfg.rewards[name].params["body_names"] = body_names
+  cfg.rewards[FINGERTIP_REWARD] = RewardTermCfg(
+    func=fingertip_tracking, weight=1.0, params={"std": 0.025}
+  )
   return cfg
 
 

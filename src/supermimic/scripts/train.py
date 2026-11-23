@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import mjlab.tasks  # noqa: F401
@@ -15,8 +14,10 @@ from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRun
 from supermimic.scripts.train_utils import (
   create_env,
   download_registry_motions,
+  resolve_local_motion_files,
   setup_device,
 )
+from supermimic.tasks.inspire import INSPIRE_TASK_ID
 
 
 @dataclass
@@ -33,6 +34,12 @@ class TrainConfig:
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
     env_cfg = load_env_cfg(task_id, play=False)
+    if task_id == INSPIRE_TASK_ID:
+      return TrainConfig(
+        env=env_cfg,
+        runner=SuperMimicRunnerCfg(actor_obs="proprio"),
+        registry_name=None,
+      )
     return TrainConfig(
       env=env_cfg,
       runner=SuperMimicRunnerCfg(),
@@ -59,13 +66,8 @@ def main() -> None:
   print(f"[INFO] Loading environment: {chosen_task}")
 
   if args.motion_file:
-    # Local motions handed straight to MotionLoader (globs/concatenates).
-    if "," in args.motion_file:
-      args.env.commands["motion"].motion_file = [
-        os.path.expanduser(p.strip()) for p in args.motion_file.split(",")
-      ]
-    else:
-      args.env.commands["motion"].motion_file = os.path.expanduser(args.motion_file)
+    files = resolve_local_motion_files(args.motion_file)
+    args.env.commands["motion"].motion_file = files if len(files) > 1 else files[0]
     args.registry_name = None  # avoid linking a stale registry artifact for lineage
     print(f"[INFO] Using local motion file: {args.motion_file}")
   else:

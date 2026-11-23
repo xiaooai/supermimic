@@ -53,6 +53,8 @@ class WorldModelEnv:
     # Reference-motion buffers.
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     self.motion = motion_cmd.motion
+    hand_valid = getattr(self.motion, "hand_valid", None)
+    self._hand_valid = hand_valid if isinstance(hand_valid, torch.Tensor) else None
     self._anchor_index = motion_cmd.motion_anchor_body_index
 
     if termination_softness <= 0.0:
@@ -98,6 +100,9 @@ class WorldModelEnv:
       actions,
       self.last_actions,
       *self._ref_body_state,
+      hand_valid=None
+      if self._hand_valid is None
+      else self._hand_valid[self.motion_times],
     )
     self.last_actions = actions
 

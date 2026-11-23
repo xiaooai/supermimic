@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -40,6 +41,8 @@ from supermimic.utils.wandb_artifacts import download_model_dir, log_model_artif
 
 if TYPE_CHECKING:
   from mjlab.rl import RslRlVecEnvWrapper
+
+LOCAL_RUN_CONFIG = "run_config.json"
 
 BpttCfg = Annotated[BpttPolicyLearnerCfg, tyro.conf.subcommand(name="bptt")]
 ActorCriticCfg = Annotated[
@@ -398,6 +401,16 @@ class SuperMimicRunner:
       "env_cfg": asdict(self.env.cfg),
       "runner_cfg": asdict(self.cfg),
     }
+    (log_dir / LOCAL_RUN_CONFIG).write_text(
+      json.dumps(
+        {
+          "task_id": self.task_id,
+          "runner_cfg": wandb_config["runner_cfg"],
+          "motion_file": self.motion_cmd.cfg.motion_file,
+        },
+        indent=2,
+      )
+    )
 
     default_name = f"{self.task_id}-{log_dir.name}"
     wandb.init(
@@ -647,7 +660,7 @@ class SuperMimicRunner:
         policy_learn_time = 0
         num_collected_steps = 0
 
-      if step % self.cfg.save_interval == 0:
+      if step % self.cfg.save_interval == 0 or step + 1 == self.cfg.max_iterations:
         assert wandb.run is not None  # _init_wandb ran before the loop
         # The previous version must be logged before its files are overwritten.
         if upload is not None:

@@ -35,6 +35,8 @@ class WorldModelLearnerCfg:
   # Loss Weights — gencoord representation
   nominal_error_joint_pos: float = 0.1
   nominal_error_joint_vel: float = 3.14
+  nominal_error_finger_pos: float = 0.05
+  nominal_error_finger_vel: float = 1.5
 
   # Loss Weights — maxcoord representation
   nominal_error_body_pos: float = 0.05

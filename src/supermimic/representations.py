@@ -34,6 +34,12 @@ from supermimic.utils.gencoord_helpers import (
   infer_num_joints_from_state_dim,
   rep_state_dim_from_num_joints,
 )
+from supermimic.utils.hand_tracking import (
+  FINGERTIP_REWARD,
+  NUM_HAND_BODIES,
+  fingertip_error_sq,
+  fingertip_score,
+)
 from supermimic.utils.helpers import (
   quat_integrate,
   quat_to_rot6d,
@@ -193,10 +199,13 @@ def motion_goal_window(
   motion: MotionLoader, motion_times: torch.Tensor
 ) -> torch.Tensor:
   """Windowed joint targets as the goal content, ``(E, N * 2J)`` — per frame
-  ``[joint_pos(J), joint_vel(J)]``.
+  ``[joint_pos(J), joint_vel(J)]`` plus a validity bit for hand-aware references.
   """
   idx = goal_window_indices(motion, motion_times)
   frames = torch.cat([motion.joint_pos[idx], motion.joint_vel[idx]], dim=-1)
+  hand_valid = getattr(motion, "hand_valid", None)
+  if isinstance(hand_valid, torch.Tensor):
+    frames = torch.cat([frames, hand_valid[idx].unsqueeze(-1).to(frames.dtype)], dim=-1)
   return frames.reshape(frames.shape[0], -1)
 
 
@@ -264,6 +273,9 @@ class StateRepresentation(nn.Module, ABC):
   }
 
   substep_coeff: float = 1.0
+  _fingertip_weight: float = 0.0
+  _fingertip_std: float | None = None
+  _encoder_bias: tuple[slice, SimContext] | None = None
 
   # ------------------------------------------------------------------
   # Abstract methods (must be implemented by subclasses)
@@ -302,6 +314,14 @@ class StateRepresentation(nn.Module, ABC):
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     """Resolve env-dependent state needed by the reward and the proprio sensor."""
     self._soft_joint_pos_limits = env.scene["robot"].data.soft_joint_pos_limits[0]
+
+  def _joint_position_with_bias(
+    self, positions: torch.Tensor, sim_ctx: torch.Tensor
+  ) -> torch.Tensor:
+    if self._encoder_bias is None:
+      return positions
+    columns, sim_context = self._encoder_bias
+    return positions + sim_context.denormalize(sim_ctx, columns)
 
   @abstractmethod
   def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
@@ -418,6 +438,7 @@ class StateRepresentation(nn.Module, ABC):
     target_body_quat_w: torch.Tensor,
     target_body_lin_vel_w: torch.Tensor,
     target_body_ang_vel_w: torch.Tensor,
+    hand_valid: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """Per-env scalar reward used for WM-env rollouts.
 
@@ -425,16 +446,31 @@ class StateRepresentation(nn.Module, ABC):
     replay buffer stores them; :class:`supermimic.models.Dynamics` is the sole
     place the raw→proc transform is applied.
     """
-    return tracking_reward(
+    pos, rot, lin_vel, ang_vel = self.world_frame_bodies(next_aux_state, next_rep_state)
+    body_slice = slice(None)
+    hand_reward = 0.0
+    if self._fingertip_std is not None:
+      assert hand_valid is not None
+      error_sq = fingertip_error_sq(
+        pos, rot, target_body_pos_w, matrix_from_quat(target_body_quat_w)
+      )
+      hand_reward = self._fingertip_weight * fingertip_score(
+        error_sq, hand_valid, self._fingertip_std
+      )
+      body_slice = slice(-NUM_HAND_BODIES)
+    return self.dt * hand_reward + tracking_reward(
       next_aux_state,
-      *self.world_frame_bodies(next_aux_state, next_rep_state),
+      pos[..., body_slice, :],
+      rot[..., body_slice, :, :],
+      lin_vel[..., body_slice, :],
+      ang_vel[..., body_slice, :],
       next_joint_state,
       action,
       last_action,
-      target_body_pos_w,
-      target_body_quat_w,
-      target_body_lin_vel_w,
-      target_body_ang_vel_w,
+      target_body_pos_w[..., body_slice, :],
+      target_body_quat_w[..., body_slice, :],
+      target_body_lin_vel_w[..., body_slice, :],
+      target_body_ang_vel_w[..., body_slice, :],
       self._soft_joint_pos_limits,
       self.dt,
     )
@@ -473,10 +509,42 @@ class GenCoordRepresentation(StateRepresentation):
     self.prediction_dim = 6 + num_joints  # [Δv_b(3), Δw_b(3), Δvj(N)]
     self._default_joint_pos = default_joint_pos
     self.fk: ForwardKinematics  # set by bind
+    self._split_hand_loss = False
 
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     super().bind(env, sim_context)
     self.fk = env.command_manager.get_term("motion").motion.fk
+    fingertip = env.cfg.rewards.get(FINGERTIP_REWARD)
+    if fingertip is not None:
+      self._fingertip_weight = fingertip.weight
+      self._fingertip_std = fingertip.params["std"]
+      columns = sim_context.find("encoder_bias")
+      self._encoder_bias = None if columns is None else (columns, sim_context)
+      fingers = [name.startswith(("L_", "R_")) for name in self.fk.joint_names]
+      self.register_buffer(
+        "_finger_joints",
+        torch.tensor(
+          [i for i, hand in enumerate(fingers) if hand],
+          dtype=torch.long,
+          device=env.device,
+        ),
+        persistent=False,
+      )
+      self.register_buffer(
+        "_body_joints",
+        torch.tensor(
+          [i for i, hand in enumerate(fingers) if not hand],
+          dtype=torch.long,
+          device=env.device,
+        ),
+        persistent=False,
+      )
+      self._split_hand_loss = True
+      self.LOSS_WEIGHT_CONFIG = {
+        **self.LOSS_WEIGHT_CONFIG,
+        "finger_pos": "nominal_error_finger_pos",
+        "finger_vel": "nominal_error_finger_vel",
+      }
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
@@ -555,11 +623,19 @@ class GenCoordRepresentation(StateRepresentation):
   ) -> dict[str, torch.Tensor]:
     # z, g_b and the root twist all follow from the integrated root pose.
     _, _, _, _, joint_pos, joint_vel = decompose_rep_state(rep_state)
-    return {
+    blocks = {
       **_root_loss_blocks(aux_state),
       "joint_pos": joint_pos,
       "joint_vel": joint_vel,
     }
+    if self._split_hand_loss:
+      blocks.update(
+        joint_pos=joint_pos.index_select(-1, self._body_joints),
+        joint_vel=joint_vel.index_select(-1, self._body_joints),
+        finger_pos=joint_pos.index_select(-1, self._finger_joints),
+        finger_vel=joint_vel.index_select(-1, self._finger_joints),
+      )
+    return blocks
 
   def world_frame_bodies(
     self, aux_state: torch.Tensor, rep_state: torch.Tensor
@@ -587,10 +663,11 @@ class GenCoordRepresentation(StateRepresentation):
     joint_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
-    del aux_state, sim_ctx
+    del aux_state
     _, g_b, _, w_b, _, _ = decompose_rep_state(rep_state)
     qj, vj = joint_state.chunk(2, dim=-1)
-    return torch.cat([g_b, w_b, qj - self._default_joint_pos, vj], dim=-1)
+    qj_rel = self._joint_position_with_bias(qj - self._default_joint_pos, sim_ctx)
+    return torch.cat([g_b, w_b, qj_rel, vj], dim=-1)
 
 
 class MaxCoordRepresentation(StateRepresentation):
@@ -621,7 +698,6 @@ class MaxCoordRepresentation(StateRepresentation):
     self.register_buffer("_default_joint_pos", default_joint_pos, persistent=False)
     self.register_buffer("_gravity_w", torch.tensor([0.0, 0.0, -1.0]), persistent=False)
     self.analytic_ik: AnalyticIK  # set by bind
-    self._encoder_bias: tuple[slice, SimContext] | None = None
 
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     super().bind(env, sim_context)
@@ -777,8 +853,7 @@ class MaxCoordRepresentation(StateRepresentation):
     projected_gravity = quat_apply_inverse(root_quat, g_w)
     _, _, _, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
     joint_pos, joint_vel = joint_state.chunk(2, dim=-1)
-    joint_pos_rel = joint_pos - self._default_joint_pos
-    if self._encoder_bias is not None:
-      columns, sim_context = self._encoder_bias
-      joint_pos_rel = joint_pos_rel + sim_context.denormalize(sim_ctx, columns)
+    joint_pos_rel = self._joint_position_with_bias(
+      joint_pos - self._default_joint_pos, sim_ctx
+    )
     return torch.cat([projected_gravity, avel[..., 0, :], joint_pos_rel, joint_vel], -1)

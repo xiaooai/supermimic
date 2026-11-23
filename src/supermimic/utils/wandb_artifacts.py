@@ -71,11 +71,15 @@ def log_model_artifact(
   ``milestone_every``-th version, and any aliased version; deletes the rest.
   """
   assert wandb.run is not None, "log_model_artifact needs an active wandb run"
+  if wandb.run.disabled:
+    return
   try:
     artifact = wandb.Artifact(f"model-{wandb.run.id}", type="model")
     for path in files:
       artifact.add_file(path)
     wandb.run.log_artifact(artifact)
+    if wandb.run.offline:
+      return
     collection = f"{wandb.run.entity}/{wandb.run.project}/model-{wandb.run.id}"
     versions = sorted(wandb.Api().artifacts("model", collection), key=_version_index)
     for stale in versions[:-keep_last]:

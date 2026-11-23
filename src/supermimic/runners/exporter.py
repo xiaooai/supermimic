@@ -7,6 +7,7 @@ needs at inference:
   buffers so the deploy can recover `(joint_pos, body_*_w)` per ``time_step``.
   Graph: ``(obs, time_step) → (action, joint_pos, joint_vel, body_pos_w,
   body_quat_w, body_lin_vel_w, body_ang_vel_w)``.
+  Hand-aware motions also return the per-frame ``hand_valid`` mask.
 - **velocity**: joystick contract — no motion baked in; the user-supplied
   command is part of ``obs``. Graph: ``(obs) → action`` where
   ``obs = cat([history, command])`` and ``command_names = ["twist"]``.
@@ -160,24 +161,26 @@ class _MotionDeployWrapper(nn.Module):
     self.register_buffer("_body_quat_w", body_quat_w.detach().cpu())
     self.register_buffer("_body_lin_vel_w", body_lin_vel_w.detach().cpu())
     self.register_buffer("_body_ang_vel_w", body_ang_vel_w.detach().cpu())
+    hand_valid = getattr(motion, "hand_valid", None)
+    self.register_buffer(
+      "_hand_valid", None if hand_valid is None else hand_valid.detach().cpu()
+    )
     self._time_step_total = int(self._joint_pos.shape[0])
+
+  @property
+  def output_names(self) -> list[str]:
+    if self._hand_valid is None:
+      return _MOTION_OUTPUT_NAMES
+    return [*_MOTION_OUTPUT_NAMES, "hand_valid"]
 
   def forward(
     self, x: torch.Tensor, time_step: torch.Tensor
-  ) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-  ]:
+  ) -> tuple[torch.Tensor, ...]:
     t = torch.clamp(time_step.long().squeeze(-1), max=self._time_step_total - 1)
     actor_in = (
       torch.cat([x, self._command_table[t]], dim=-1) if self._has_command else x
     )
-    return (
+    outputs = (
       self.actor(actor_in),
       self._joint_pos[t],
       self._joint_vel[t],
@@ -186,6 +189,9 @@ class _MotionDeployWrapper(nn.Module):
       self._body_lin_vel_w[t],
       self._body_ang_vel_w[t],
     )
+    if self._hand_valid is None:
+      return outputs
+    return (*outputs, self._hand_valid[t])
 
 
 def _tracking_metadata(env: ManagerBasedRlEnv, run_name: str) -> dict:
@@ -194,6 +200,10 @@ def _tracking_metadata(env: ManagerBasedRlEnv, run_name: str) -> dict:
   metadata = get_base_metadata(env, run_name)
   metadata["anchor_body_name"] = motion_term.cfg.anchor_body_name
   metadata["body_names"] = list(motion_term.cfg.body_names)
+  if hasattr(motion_term.motion, "hand_valid"):
+    joint_action = env.action_manager.get_term("joint_pos")
+    metadata["action_joint_names"] = list(joint_action.target_names)
+    metadata["action_offset"] = joint_action.offset[0].cpu().tolist()
   return metadata
 
 
@@ -206,7 +216,7 @@ def _export_motion_graph(
     wrapper,
     (torch.zeros(1, wrapper.obs_input_size), torch.zeros(1, 1)),
     ["obs", "time_step"],
-    _MOTION_OUTPUT_NAMES,
+    wrapper.output_names,
     path,
     filename,
   )
